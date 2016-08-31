@@ -82,12 +82,6 @@ vlVdpVideoMixerCreate(VdpDevice device,
       switch (features[i]) {
       /* they are valid, but we doesn't support them */
       case VDP_VIDEO_MIXER_FEATURE_DEINTERLACE_TEMPORAL_SPATIAL:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L8:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L9:
       case VDP_VIDEO_MIXER_FEATURE_INVERSE_TELECINE:
@@ -111,6 +105,15 @@ vlVdpVideoMixerCreate(VdpDevice device,
 
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L1:
          vmixer->bicubic.supported = true;
+         break;
+
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
+         vmixer->lanczos.supported = true;
          break;
       default: goto no_params;
       }
@@ -208,6 +211,10 @@ vlVdpVideoMixerDestroy(VdpVideoMixer mixer)
    if (vmixer->bicubic.filter) {
       vl_bicubic_filter_cleanup(vmixer->bicubic.filter);
       FREE(vmixer->bicubic.filter);
+   }
+   if (vmixer->lanczos.filter) {
+      vl_lanczos_filter_cleanup(vmixer->lanczos.filter);
+      FREE(vmixer->lanczos.filter);
    }
    pipe_mutex_unlock(vmixer->device->mutex);
    DeviceReference(&vmixer->device, NULL);
@@ -337,7 +344,8 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
    }
    vl_compositor_set_buffer_layer(&vmixer->cstate, compositor, layer, video_buffer, prect, NULL, deinterlace);
 
-   if (vmixer->bicubic.filter || vmixer->sharpness.filter || vmixer->noise_reduction.filter) {
+   if (vmixer->bicubic.filter || vmixer->sharpness.filter ||
+       vmixer->noise_reduction.filter || vmixer->lanczos.filter) {
       pipe = vmixer->device->context;
       memset(&res_tmpl, 0, sizeof(res_tmpl));
 
@@ -348,7 +356,7 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
       res_tmpl.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
       res_tmpl.usage = PIPE_USAGE_DEFAULT;
 
-      if (!vmixer->bicubic.filter) {
+      if (!vmixer->bicubic.filter && !vmixer->lanczos.filter) {
          res_tmpl.width0 = dst->surface->width;
          res_tmpl.height0 = dst->surface->height;
       } else {
@@ -373,7 +381,7 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
       dirty_area = dst->dirty_area;
    }
 
-   if (!vmixer->bicubic.filter) {
+   if (!vmixer->bicubic.filter && !vmixer->lanczos.filter) {
       vl_compositor_set_layer_dst_area(&vmixer->cstate, layer++, RectToPipe(destination_video_rect, &rect));
       vl_compositor_set_dst_clip(&vmixer->cstate, RectToPipe(destination_rect, &clip));
    }
@@ -394,7 +402,7 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
       ++layers;
    }
 
-   if (!vmixer->noise_reduction.filter && !vmixer->sharpness.filter && !vmixer->bicubic.filter)
+   if (!vmixer->noise_reduction.filter && !vmixer->sharpness.filter && !vmixer->bicubic.filter && !vmixer->lanczos.filter)
       vlVdpSave4DelayedRendering(vmixer->device, destination_surface, &vmixer->cstate);
    else {
       vl_compositor_render(&vmixer->cstate, compositor, surface, &dirty_area, true);
@@ -446,6 +454,12 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
                                  sampler_view, dst->surface,
                                  RectToPipe(destination_video_rect, &rect),
                                  RectToPipe(destination_rect, &clip));
+
+      if (vmixer->lanczos.filter)
+         vl_lanczos_filter_render(vmixer->lanczos.filter,
+                                  sampler_view, dst->surface,
+                                  RectToPipe(destination_video_rect, &rect),
+                                  RectToPipe(destination_rect, &clip));
 
       if(surface != dst->surface) {
          pipe_sampler_view_reference(&sampler_view, NULL);
@@ -575,6 +589,29 @@ vlVdpVideoMixerUpdateBicubicFilter(vlVdpVideoMixer *vmixer)
 }
 
 /**
+ * Update the lanczos filter
+ */
+static void
+vlVdpVideoMixerUpdateLanczosFilter(vlVdpVideoMixer *vmixer)
+{
+   assert(vmixer);
+
+   /* if present remove the old filter first */
+   if (vmixer->lanczos.filter) {
+      vl_lanczos_filter_cleanup(vmixer->lanczos.filter);
+      FREE(vmixer->lanczos.filter);
+      vmixer->lanczos.filter = NULL;
+   }
+   /* and create a new filter as needed */
+   if (vmixer->lanczos.enabled) {
+      vmixer->lanczos.filter = MALLOC(sizeof(struct vl_lanczos_filter));
+      vl_lanczos_filter_init(vmixer->lanczos.filter, vmixer->device->context,
+                             vmixer->lanczos.size, vmixer->video_width,
+                             vmixer->video_height);
+   }
+}
+
+/**
  * Retrieve whether features were requested at creation time.
  */
 VdpStatus
@@ -597,12 +634,6 @@ vlVdpVideoMixerGetFeatureSupport(VdpVideoMixer mixer,
       switch (features[i]) {
       /* they are valid, but we doesn't support them */
       case VDP_VIDEO_MIXER_FEATURE_DEINTERLACE_TEMPORAL_SPATIAL:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L8:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L9:
       case VDP_VIDEO_MIXER_FEATURE_INVERSE_TELECINE:
@@ -627,6 +658,15 @@ vlVdpVideoMixerGetFeatureSupport(VdpVideoMixer mixer,
 
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L1:
          feature_supports[i] = vmixer->bicubic.supported;
+         break;
+
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
+         feature_supports[i] = vmixer->lanczos.supported;
          break;
 
       default:
@@ -661,12 +701,6 @@ vlVdpVideoMixerSetFeatureEnables(VdpVideoMixer mixer,
       switch (features[i]) {
       /* they are valid, but we doesn't support them */
       case VDP_VIDEO_MIXER_FEATURE_DEINTERLACE_TEMPORAL_SPATIAL:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L8:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L9:
       case VDP_VIDEO_MIXER_FEATURE_INVERSE_TELECINE:
@@ -697,6 +731,18 @@ vlVdpVideoMixerSetFeatureEnables(VdpVideoMixer mixer,
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L1:
          vmixer->bicubic.enabled = feature_enables[i];
          vlVdpVideoMixerUpdateBicubicFilter(vmixer);
+         break;
+
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
+         vmixer->lanczos.enabled = feature_enables[i];
+         vmixer->lanczos.size = features[i] -
+                                VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L1 + 1;
+         vlVdpVideoMixerUpdateLanczosFilter(vmixer);
          break;
 
       default:
@@ -733,12 +779,6 @@ vlVdpVideoMixerGetFeatureEnables(VdpVideoMixer mixer,
       /* they are valid, but we doesn't support them */
       case VDP_VIDEO_MIXER_FEATURE_DEINTERLACE_TEMPORAL:
       case VDP_VIDEO_MIXER_FEATURE_DEINTERLACE_TEMPORAL_SPATIAL:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
-      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L8:
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L9:
       case VDP_VIDEO_MIXER_FEATURE_INVERSE_TELECINE:
@@ -758,6 +798,15 @@ vlVdpVideoMixerGetFeatureEnables(VdpVideoMixer mixer,
 
       case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L1:
          feature_enables[i] = vmixer->bicubic.enabled;
+         break;
+
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L2:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L3:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L4:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L5:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L6:
+      case VDP_VIDEO_MIXER_FEATURE_HIGH_QUALITY_SCALING_L7:
+         feature_enables[i] = vmixer->lanczos.enabled;
          break;
 
       default:

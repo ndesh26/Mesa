@@ -49,6 +49,7 @@
 #include "vl/vl_compositor.h"
 #include "vl/vl_csc.h"
 #include "vl/vl_deint_filter.h"
+#include "vl/vl_lanczos_filter.h"
 #include "vl/vl_matrix_filter.h"
 #include "vl/vl_median_filter.h"
 #include "vl/vl_winsys.h"
@@ -377,6 +378,12 @@ typedef struct
 	  bool supported, enabled;
 	  struct vl_bicubic_filter *filter;
    } bicubic;
+
+   struct {
+      bool supported, enabled;
+      unsigned size;
+      struct vl_lanczos_filter *filter;
+   } lanczos;
 
    struct {
       bool supported, enabled;
