@@ -331,6 +331,8 @@ VL_SOURCES := \
 	vl/vl_deint_filter.h \
 	vl/vl_idct.c \
 	vl/vl_idct.h \
+	vl/vl_lanczos_filter.c \
+	vl/vl_lanczos_filter.h \
 	vl/vl_matrix_filter.c \
 	vl/vl_matrix_filter.h \
 	vl/vl_mc.c \
