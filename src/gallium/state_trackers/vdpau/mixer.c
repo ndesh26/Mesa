@@ -203,6 +203,8 @@ vlVdpVideoMixerDestroy(VdpVideoMixer mixer)
    if (vmixer->sharpness.filter) {
       vl_matrix_filter_cleanup(vmixer->sharpness.filter);
       FREE(vmixer->sharpness.filter);
+      vl_matrix_filter_cleanup(vmixer->sharpness.filter2);
+      FREE(vmixer->sharpness.filter2);
    }
 
    if (vmixer->bicubic.filter) {
@@ -239,11 +241,10 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
    enum vl_compositor_deinterlace deinterlace;
    struct u_rect rect, clip, *prect, dirty_area;
    unsigned i, layer = 0;
-   struct pipe_video_buffer *video_buffer;
-   struct pipe_sampler_view *sampler_view, sv_templ;
-   struct pipe_surface *surface, surf_templ;
+   struct pipe_video_buffer *video_buffer, templ, *video_buffer_output, *video_buffer_temp = NULL;
+   struct pipe_sampler_view *sampler_view, **sampler_views;
+   struct pipe_surface *surface, **surfaces;
    struct pipe_context *pipe;
-   struct pipe_resource res_tmpl, *res;
 
    vlVdpVideoMixer *vmixer;
    vlVdpSurface *surf;
@@ -327,6 +328,57 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
       }
    }
 
+   video_buffer_output = video_buffer;
+
+   if (vmixer->noise_reduction.filter || vmixer->sharpness.filter) {
+      pipe = vmixer->device->context;
+
+      memset(&templ, 0, sizeof(templ));
+      templ.buffer_format = video_buffer->buffer_format;
+      templ.chroma_format = video_buffer->chroma_format;
+      templ.width = video_buffer->width;
+      templ.height = video_buffer->height;
+      templ.interlaced = video_buffer->interlaced;
+
+   }
+
+   if (vmixer->noise_reduction.filter) {
+      sampler_views = video_buffer->get_sampler_view_planes(video_buffer_output);
+      video_buffer_output = vl_video_buffer_create(pipe, &templ);
+      surfaces = video_buffer_output->get_surfaces(video_buffer_output);
+
+      for(i = 0; i < VL_MAX_SURFACES; ++i) {
+         if(sampler_views[i] != NULL && surfaces[i] != NULL)
+            vl_median_filter_render(vmixer->noise_reduction.filter,
+                                    sampler_views[i], surfaces[i]);
+      }
+   }
+
+   if (vmixer->sharpness.filter) {
+      sampler_views = video_buffer_output->get_sampler_view_planes(video_buffer_output);
+      /*
+       * To keep a pointer to the buffer allocated
+       * if noise reduction is enabled so that it
+       * can be destroyed in the end
+       */
+      if (video_buffer_output != video_buffer)
+         video_buffer_temp = video_buffer_output;
+      video_buffer_output = vl_video_buffer_create(pipe, &templ);
+      surfaces = video_buffer_output->get_surfaces(video_buffer_output);
+
+      for (i = 0; i < VL_MAX_SURFACES; ++i) {
+         if (sampler_views[i] != NULL && surfaces[i] != NULL) {
+            if(i==0)
+             vl_matrix_filter_render(vmixer->sharpness.filter,
+                                    sampler_views[i], surfaces[i]);
+            else
+             vl_matrix_filter_render(vmixer->sharpness.filter2,
+                                    sampler_views[i], surfaces[i]);
+
+         }
+      }
+   }
+
    prect = RectToPipe(video_source_rect, &rect);
    if (!prect) {
       rect.x0 = 0;
@@ -335,26 +387,25 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
       rect.y1 = surf->templat.height;
       prect = &rect;
    }
-   vl_compositor_set_buffer_layer(&vmixer->cstate, compositor, layer, video_buffer, prect, NULL, deinterlace);
+   vl_compositor_set_buffer_layer(&vmixer->cstate, compositor, layer, video_buffer_output, prect, NULL, deinterlace);
 
-   if (vmixer->bicubic.filter || vmixer->sharpness.filter || vmixer->noise_reduction.filter) {
+   if(vmixer->bicubic.filter) {
+      struct pipe_context *pipe;
+      struct pipe_resource res_tmpl, *res;
+      struct pipe_sampler_view sv_templ;
+      struct pipe_surface surf_templ;
+
       pipe = vmixer->device->context;
       memset(&res_tmpl, 0, sizeof(res_tmpl));
 
       res_tmpl.target = PIPE_TEXTURE_2D;
+      res_tmpl.width0 = surf->templat.width;
+      res_tmpl.height0 = surf->templat.height;
       res_tmpl.format = dst->sampler_view->format;
       res_tmpl.depth0 = 1;
       res_tmpl.array_size = 1;
       res_tmpl.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
       res_tmpl.usage = PIPE_USAGE_DEFAULT;
-
-      if (!vmixer->bicubic.filter) {
-         res_tmpl.width0 = dst->surface->width;
-         res_tmpl.height0 = dst->surface->height;
-      } else {
-         res_tmpl.width0 = surf->templat.width;
-         res_tmpl.height0 = surf->templat.height;
-      }
 
       res = pipe->screen->resource_create(pipe->screen, &res_tmpl);
 
@@ -371,9 +422,6 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
       surface = dst->surface;
       sampler_view = dst->sampler_view;
       dirty_area = dst->dirty_area;
-   }
-
-   if (!vmixer->bicubic.filter) {
       vl_compositor_set_layer_dst_area(&vmixer->cstate, layer++, RectToPipe(destination_video_rect, &rect));
       vl_compositor_set_dst_clip(&vmixer->cstate, RectToPipe(destination_rect, &clip));
    }
@@ -399,48 +447,6 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
    else {
       vl_compositor_render(&vmixer->cstate, compositor, surface, &dirty_area, true);
 
-      if (vmixer->noise_reduction.filter) {
-         if (!vmixer->sharpness.filter && !vmixer->bicubic.filter) {
-            vl_median_filter_render(vmixer->noise_reduction.filter,
-                                    sampler_view, dst->surface);
-         } else {
-            res = pipe->screen->resource_create(pipe->screen, &res_tmpl);
-            struct pipe_sampler_view *sampler_view_temp = pipe->create_sampler_view(pipe, res, &sv_templ);
-            struct pipe_surface *surface_temp = pipe->create_surface(pipe, res, &surf_templ);
-            pipe_resource_reference(&res, NULL);
-
-            vl_median_filter_render(vmixer->noise_reduction.filter,
-                                    sampler_view, surface_temp);
-
-            pipe_sampler_view_reference(&sampler_view, NULL);
-            pipe_surface_reference(&surface, NULL);
-
-            sampler_view = sampler_view_temp;
-            surface = surface_temp;
-         }
-      }
-
-      if (vmixer->sharpness.filter) {
-         if (!vmixer->bicubic.filter) {
-            vl_matrix_filter_render(vmixer->sharpness.filter,
-                                    sampler_view, dst->surface);
-         } else {
-            res = pipe->screen->resource_create(pipe->screen, &res_tmpl);
-            struct pipe_sampler_view *sampler_view_temp = pipe->create_sampler_view(pipe, res, &sv_templ);
-            struct pipe_surface *surface_temp = pipe->create_surface(pipe, res, &surf_templ);
-            pipe_resource_reference(&res, NULL);
-
-            vl_matrix_filter_render(vmixer->sharpness.filter,
-                                    sampler_view, surface_temp);
-
-            pipe_sampler_view_reference(&sampler_view, NULL);
-            pipe_surface_reference(&surface, NULL);
-
-            sampler_view = sampler_view_temp;
-            surface = surface_temp;
-         }
-      }
-
       if (vmixer->bicubic.filter)
          vl_bicubic_filter_render(vmixer->bicubic.filter,
                                  sampler_view, dst->surface,
@@ -452,6 +458,12 @@ VdpStatus vlVdpVideoMixerRender(VdpVideoMixer mixer,
          pipe_surface_reference(&surface, NULL);
       }
    }
+
+   if(video_buffer_output != video_buffer)
+      video_buffer_output->destroy(video_buffer_output);
+   if(video_buffer_temp != NULL)
+      video_buffer_temp->destroy(video_buffer_temp);
+
    pipe_mutex_unlock(vmixer->device->mutex);
 
    return VDP_STATUS_OK;
@@ -517,6 +529,10 @@ vlVdpVideoMixerUpdateSharpnessFilter(vlVdpVideoMixer *vmixer)
       vl_matrix_filter_cleanup(vmixer->sharpness.filter);
       FREE(vmixer->sharpness.filter);
       vmixer->sharpness.filter = NULL;
+      vl_matrix_filter_cleanup(vmixer->sharpness.filter2);
+      FREE(vmixer->sharpness.filter2);
+      vmixer->sharpness.filter2 = NULL;
+
    }
 
    /* and create a new filter as needed */
@@ -546,9 +562,14 @@ vlVdpVideoMixerUpdateSharpnessFilter(vlVdpVideoMixer *vmixer)
       }
 
       vmixer->sharpness.filter = MALLOC(sizeof(struct vl_matrix_filter));
+      vmixer->sharpness.filter2 = MALLOC(sizeof(struct vl_matrix_filter));
       vl_matrix_filter_init(vmixer->sharpness.filter, vmixer->device->context,
                             vmixer->video_width, vmixer->video_height,
                             3, 3, matrix);
+      vl_matrix_filter_init(vmixer->sharpness.filter2, vmixer->device->context,
+                            (vmixer->video_width)/2, (vmixer->video_height)/2,
+                            3, 3, matrix);
+
    }
 }
 

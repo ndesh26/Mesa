@@ -388,6 +388,7 @@ typedef struct
       bool supported, enabled;
       float value;
       struct vl_matrix_filter *filter;
+      struct vl_matrix_filter *filter2;
    } sharpness;
 
    unsigned video_width, video_height;
