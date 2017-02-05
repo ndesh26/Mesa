@@ -82,5 +82,16 @@ void vlVaHandleIQMatrixBufferMPEG12(vlVaContext *context, vlVaBuffer *buf)
 void vlVaHandleSliceParameterBufferMPEG12(vlVaContext *context, vlVaBuffer *buf)
 {
    assert(buf->size >= sizeof(VASliceParameterBufferMPEG2));
+   VASliceParameterBufferMPEG2 *mpeg2 = buf->data;
+   unsigned *sizes = MALLOC(buf->num_elements * sizeof(unsigned));
+   int i;
+
    context->desc.mpeg12.num_slices += buf->num_elements;
+
+   for(i = 0; i < buf->num_elements; ++i) {
+      sizes[i] = mpeg2->slice_data_size;
+      mpeg2 = mpeg2 + 1;
+   }
+
+   context->sizes = sizes;
 }

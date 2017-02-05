@@ -262,8 +262,10 @@ handleVASliceDataBufferType(vlVaContext *context, vlVaBuffer *buf)
 {
    enum pipe_video_format format;
    unsigned num_buffers = 0;
-   void * const *buffers[2];
-   unsigned sizes[2];
+   void * const *buffers[context->desc.mpeg12.num_slices + 1];
+   unsigned sizes[context->desc.mpeg12.num_slices + 1];
+   char *cur;
+   int i;
    static const uint8_t start_code_h264[] = { 0x00, 0x00, 0x01 };
    static const uint8_t start_code_h265[] = { 0x00, 0x00, 0x01 };
    static const uint8_t start_code_vc1[] = { 0x00, 0x00, 0x01, 0x0d };
@@ -306,9 +308,12 @@ handleVASliceDataBufferType(vlVaContext *context, vlVaBuffer *buf)
       break;
    }
 
-   buffers[num_buffers] = buf->data;
-   sizes[num_buffers] = buf->size;
-   ++num_buffers;
+   cur = buf->data;
+   for (i = 0; i < context->desc.mpeg12.num_slices; ++i) {
+      buffers[i] = cur;
+      cur = cur + context->sizes[i];
+   }
+
 
    if (context->needs_begin_frame) {
       context->decoder->begin_frame(context->decoder, context->target,
@@ -316,7 +321,8 @@ handleVASliceDataBufferType(vlVaContext *context, vlVaBuffer *buf)
       context->needs_begin_frame = false;
    }
    context->decoder->decode_bitstream(context->decoder, context->target, &context->desc.base,
-      num_buffers, (const void * const*)buffers, sizes);
+      context->desc.mpeg12.num_slices, (const void * const*)buffers, context->sizes);
+
 }
 
 static VAStatus
@@ -586,6 +592,7 @@ vlVaEndPicture(VADriverContextP ctx, VAContextID context_id)
    }
 
    context->decoder->end_frame(context->decoder, context->target, &context->desc.base);
+   FREE(context->sizes);
    if (context->decoder->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE) {
       int idr_period = context->desc.h264enc.gop_size / context->gop_coeff;
       int p_remain_in_idr = idr_period - context->desc.h264enc.frame_num;

@@ -263,6 +263,7 @@ typedef struct {
    bool first_single_submitted;
    int gop_coeff;
    bool needs_begin_frame;
+   unsigned *sizes;
 } vlVaContext;
 
 typedef struct {
